@@ -1,0 +1,196 @@
+# ghes-backup
+# Uses GitHub Enterprise Server Backup Utilities to execute scheduled backups using GitHub Actions
+# https://github.com/github/backup-utils
+
+# Runner should be setup on the server which is the backup executor/target and be repository-scoped to
+#  only be available to this repository.
+
+# See requirements for runner (backup host):
+#  https://github.com/github/backup-utils/blob/master/docs/requirements.md
+
+name: ghes-backup
+
+on:
+  workflow_call:
+    inputs:
+      GHE_HOSTNAME:
+        description: |
+          The hostname of the GitHub Enterprise Server appliance to back up. The host
+          must be reachable via SSH from the runner (backup host).
+        required: true
+        type: string
+      GHE_DATA_DIR:
+        description: |
+          Path to where backup data is stored. This can be a relative or absolute path.
+        required: true
+        type: string
+      GHE_NUM_SNAPSHOTS:
+        description: |
+          The number of backup snapshots to retain. Old snapshots are pruned after each
+          successful ghe-backup run. This option should be tuned based on the frequency
+          of scheduled backup runs. If backups are scheduled hourly, snapshots will be
+          available for the past N hours; if backups are scheduled daily, snapshots will
+          be available for the past N days
+        required: false
+        default: 10
+        type: string
+      GHE_VERBOSE_LOG:
+        description: |
+          When verbose output is enabled with `-v`, it's written to stdout by default. If
+          you'd prefer it to be written to a separate file, set this option.
+        required: false
+        type: string
+      GHE_EXTRA_SSH_OPTS:
+        description: |
+          Any extra options passed to the SSH command.
+          In a single instance environment, nothing is required by default.
+          In a clustering environment, "-i abs-path-to-ssh-private-key" is required.
+        required: false
+        type: string
+      GHE_EXTRA_RSYNC_OPTS:
+        description: |
+          Any extra options passed to the rsync command. Nothing required by default.
+        required: false
+        type: string
+      GHE_CREATE_DATA_DIR:
+        description: |
+          If set to 'no', GHE_DATA_DIR will not be created automatically
+          and restore/backup will exit 8
+        required: false
+        type: string
+      GHE_MSSQL_BACKUP_CADENCE:
+        description: |
+          Cadence of MSSQL backups
+          <full>,<differential>,<transactionlog> all in minutes
+          e.g.
+            - Full backup every week (10080 minutes)
+            - Differential backup every day (1440 minutes)
+            - Transactionlog backup every 15 minutes
+          default: 10080,1440,15
+        required: false
+        type: string
+      GHE_PARALLEL_ENABLED:
+        description: |
+          If set to 'yes', ghe-backup jobs will run in parallel. Defaults to 'no'.
+          WARNING: this feature is in beta.
+        required: false
+        type: string
+      GHE_PARALLEL_MAX_JOBS:
+        description: |
+          Sets the maximum number of jobs to run in parallel. Defaults to the number
+          of available processing units on the machine.
+          WARNING: this feature is in beta.
+        required: false
+        type: string
+      GHE_PARALLEL_RSYNC_MAX_JOBS:
+        description: |
+          Sets the maximum number of rsync jobs to run in parallel. Defaults to the
+          configured GHE_PARALLEL_MAX_JOBS, or the number of available processing
+          units on the machine.
+          WARNING: this feature is in beta.
+        required: false
+        type: string
+      GHE_PARALLEL_MAX_LOAD:
+        description: |
+          When jobs are running in parallel wait as needed to avoid starting new jobs
+          when the system load average is not below the specified percentage. Defaults to
+          unrestricted.
+          WARNING: this feature is in beta.
+        required: false
+        type: string
+      GHE_EXTERNAL_DATABASE_BACKUP_SCRIPT:
+        description: |
+          When running an external mysql database, run this script to trigger a MySQL backup
+          rather than attempting to backup via backup-utils directly.
+          EXTERNAL_DATABASE_BACKUP_SCRIPT="/bin/false"
+        required: false
+        type: string
+
+# inputs passed as env variables to mitigate script injection attacks
+# https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#good-practices-for-mitigating-script-injection-attacks
+env:
+  GHE_HOSTNAME: ${{ inputs.GHE_HOSTNAME }}
+  GHE_DATA_DIR: ${{ inputs.GHE_DATA_DIR }}
+  GHE_NUM_SNAPSHOTS: ${{ inputs.GHE_NUM_SNAPSHOTS }}
+  GHE_VERBOSE_LOG: ${{ inputs.GHE_VERBOSE_LOG }}
+  GHE_EXTRA_SSH_OPTS: ${{ inputs.GHE_EXTRA_SSH_OPTS }}
+  GHE_EXTRA_RSYNC_OPTS: ${{ inputs.GHE_EXTRA_RSYNC_OPTS }}
+  GHE_CREATE_DATA_DIR: ${{ inputs.GHE_CREATE_DATA_DIR }}
+  GHE_MSSQL_BACKUP_CADENCE: ${{ inputs.GHE_MSSQL_BACKUP_CADENCE }}
+  GHE_PARALLEL_ENABLED: ${{ inputs.GHE_PARALLEL_ENABLED }}
+  GHE_PARALLEL_MAX_JOBS: ${{ inputs.GHE_PARALLEL_MAX_JOBS }}
+  GHE_PARALLEL_RSYNC_MAX_JOBS: ${{ inputs.GHE_PARALLEL_RSYNC_MAX_JOBS }}
+  GHE_PARALLEL_MAX_LOAD: ${{ inputs.GHE_PARALLEL_MAX_LOAD }}
+  GHE_EXTERNAL_DATABASE_BACKUP_SCRIPT: ${{ inputs.GHE_EXTERNAL_DATABASE_BACKUP_SCRIPT }}
+
+jobs:
+  backup:
+    runs-on: ghes-backup-runner
+    # Set a realistic timeout for the job (default is 360 minutes)
+    timeout-minutes: 1380
+    steps:
+      # Run validations before attempting to execute backup to verify any dependencies or pre-req items
+      - name: verify openSSH
+        run: which ssh
+      - name: verify awk
+        run: which awk
+      - name: verify rsync
+        run: which rsync
+      - name: verify git
+        run: which git
+      - name: verify GHES access
+        run: |
+          if [ ! -d ~/.ssh ] ; then mkdir ~/.ssh ; fi
+          grep -q "${GHE_HOSTNAME}" ~/.ssh/known_hosts || (ssh-keyscan -p 122 "${GHE_HOSTNAME}" >> ~/.ssh/known_hosts)
+          ssh -p 122 "admin@${GHE_HOSTNAME}" ghe-version
+      # Consider using a locally installed version of backup-utils instead of fresh fetch for each job
+      - name: fetch backup-utils
+        run: if [ ! -d backup-utils ] ; then git clone https://github.com/github/backup-utils ; fi
+      # Create the backup.config file from workflow inputs.  Remove existing backup.config, if present
+      - name: backup-config prep
+        run: |
+          cd backup-utils
+          if [ -f backup.config ] ; then mv backup.config backup.config.old ; fi
+      - name: backup-config GHE_HOSTNAME
+        run: cd backup-utils ; echo "GHE_HOSTNAME=${GHE_HOSTNAME}" >> backup.config
+        if: "${{ inputs.GHE_HOSTNAME != '' }}"
+      - name: backup-config GHE_DATA_DIR
+        run: cd backup-utils ; echo "GHE_DATA_DIR=${GHE_DATA_DIR}" >> backup.config
+        if: "${{ inputs.GHE_DATA_DIR != '' }}"
+      - name: backup-config GHE_NUM_SNAPSHOTS
+        run: cd backup-utils ; echo "GHE_NUM_SNAPSHOTS=${GHE_NUM_SNAPSHOTS}" >> backup.config
+        if: "${{ inputs.GHE_NUM_SNAPSHOTS != '' }}"
+      - name: backup-config GHE_VERBOSE_LOG
+        run: cd backup-utils ; echo "GHE_VERBOSE_LOG=${GHE_VERBOSE_LOG}" >> backup.config
+        if: "${{ inputs.GHE_VERBOSE_LOG != '' }}"
+      - name: backup-config GHE_EXTRA_SSH_OPTS
+        run: cd backup-utils ; echo "GHE_EXTRA_SSH_OPTS=${GHE_EXTRA_SSH_OPTS}" >> backup.config
+        if: "${{ inputs.GHE_EXTRA_SSH_OPTS != '' }}"
+      - name: backup-config GHE_EXTRA_RSYNC_OPTS
+        run: cd backup-utils ; echo "GHE_EXTRA_RSYNC_OPTS=${GHE_EXTRA_RSYNC_OPTS}" >> backup.config
+        if: "${{ inputs.GHE_EXTRA_RSYNC_OPTS != '' }}"
+      - name: backup-config GHE_CREATE_DATA_DIR
+        run: cd backup-utils ; echo "GHE_CREATE_DATA_DIR=${GHE_CREATE_DATA_DIR}" >> backup.config
+        if: "${{ inputs.GHE_CREATE_DATA_DIR != '' }}"
+      - name: backup-config GHE_MSSQL_BACKUP_CADENCE
+        run: cd backup-utils ; echo "GHE_MSSQL_BACKUP_CADENCE=${GHE_MSSQL_BACKUP_CADENCE}" >> backup.config
+        if: "${{ inputs.GHE_MSSQL_BACKUP_CADENCE != '' }}"
+      - name: backup-config GHE_PARALLEL_ENABLED
+        run: cd backup-utils ; echo "GHE_PARALLEL_ENABLED=${GHE_PARALLEL_ENABLED}" >> backup.config
+        if: "${{ inputs.GHE_PARALLEL_ENABLED != '' }}"
+      - name: backup-config GHE_PARALLEL_MAX_JOBS
+        run: cd backup-utils ; echo "GHE_PARALLEL_MAX_JOBS=${GHE_PARALLEL_MAX_JOBS}" >> backup.config
+        if: "${{ inputs.GHE_PARALLEL_MAX_JOBS != '' }}"
+      - name: backup-config GHE_PARALLEL_RSYNC_MAX_JOBS
+        run: cd backup-utils ; echo "GHE_PARALLEL_RSYNC_MAX_JOBS=${GHE_PARALLEL_RSYNC_MAX_JOBS}" >> backup.config
+        if: "${{ inputs.GHE_PARALLEL_RSYNC_MAX_JOBS != '' }}"
+      - name: backup-config GHE_PARALLEL_MAX_LOAD
+        run: cd backup-utils ; echo "GHE_PARALLEL_MAX_LOAD=${GHE_PARALLEL_MAX_LOAD}" >> backup.config
+        if: "${{ inputs.GHE_PARALLEL_MAX_LOAD != '' }}"
+      - name: backup-config GHE_EXTERNAL_DATABASE_BACKUP_SCRIPT
+        run: cd backup-utils ; echo "EXTERNAL_DATABASE_BACKUP_SCRIPT=${GHE_EXTERNAL_DATABASE_BACKUP_SCRIPT}" >> backup.config
+        if: "${{ inputs.GHE_EXTERNAL_DATABASE_BACKUP_SCRIPT != '' }}"
+      - name: exec backup
+        run: cd backup-utils ; bin/ghe-backup
+      - name: verify
+        run: ls -al "${GHE_DATA_DIR}"

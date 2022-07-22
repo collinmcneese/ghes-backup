@@ -1,0 +1,16 @@
+# ghes-backup-cron
+
+name: ghes-backup-cron
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron:  '22 2 * * *'
+
+jobs:
+  ghes-backup:
+    uses: ./.github/workflows/ghes-backup.yml
+    with:
+      GHE_HOSTNAME: localhost
+      GHE_DATA_DIR: /tmp/ghes-backup
+      GHE_NUM_SNAPSHOTS: "3"
